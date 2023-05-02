@@ -30,7 +30,7 @@ struct Cli{
     let client: Client = Client::new(&config);
 
     // Create LazyFrame
-    let df: LazyFrame = create_lazy_frame(&client, &cli.source_bucket)?;
+    let df: LazyFrame = create_lazy_frame(&client, &cli.source_bucket).await?;
 
     //Get SQL context 
     let mut ctx = SQLContext::try_new()?;
@@ -50,7 +50,6 @@ struct Cli{
  }
 
 
- #[tokio::main]
  async fn create_lazy_frame(client:&Client, source_bucket:&str) -> Result<LazyFrame,Box<dyn std::error::Error>> {
     //Create an empty Vector to store LazyFrames 
     let mut dfs: Vec<LazyFrame>= Vec::new();
