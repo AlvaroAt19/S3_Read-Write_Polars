@@ -1,71 +1,86 @@
 use aws_sdk_s3::Client;
+use polars_sql::*;
 use polars::prelude::*;
+use clap::Parser;
+
  
+#[derive(Parser)]
+struct Cli{
+    /// S3 bucket name/folder to get files
+    #[arg(short = 'b', long = "sb")]
+    source_bucket: String,
+    
+    /// Query SQL, use df as DataFrame name like: "SELECT col_a FROM df"
+    #[arg(short = 'q', long = "qu", default_value_t = String::from("SELECT * FROM df"))]
+    query: String,
+
+    /// Save dataframe localy
+    #[arg(short, long)]
+    save: bool,
+}
  
+
  #[tokio::main]
  async fn main() -> Result<(),Box<dyn std::error::Error>> {
-     //Define source bucket name
-     let source_bucket:&str = "SOURCE_BUCKET_NAME";
-     //Define destiny bucket name
-     let destiny_bucket:&str = "DESTINY_BUCKET_NAME";
- 
-     //Load aws credentials and connect a Client to S3
-     let config = aws_config::from_env().load().await;
-     let client = Client::new(&config);
- 
-     //Create an empty Vector to store LazyFrames 
-     let mut dfs= Vec::new();
- 
-     // Read parquet files to an Cursor use it to create an LazyFrame from Parquet
-     {   
-         //List all objects in bucket whit the chosen PREFIX
-         let objects = client.list_objects_v2().bucket(source_bucket).prefix("PREFIX").send().await?;
-         //Loop throug all files and read each file to an Lazy Frame
-         for obj in objects.contents().unwrap_or_default() {
-             let req = client.get_object()
-                                     .bucket(source_bucket)
-                                     .key(obj.key().unwrap())
-                                     .send()
-                                     .await?
-                                     .body
-                                     .collect()
-                                     .await?;
- 
-             let df = ParquetReader::new(std::io::Cursor::new(req.into_bytes()))
-                                     .finish()?
-                                     .lazy();
-             
-             //Store the LazyFrame into dfs Vec           
-             dfs.push(df);
-         };
-     };
-     //Concat all LazyFrames into one LazyFrame
-     let df = concat(dfs,true,true)?;
- 
-     //Do data transformation
-     let mut df = df.collect()?;
- 
-     //Create an empty cursor to store DF bytes and save them into S3
-     let mut bytes = std::io::Cursor::new(Vec::new());
- 
-     //Write the parquet data into the bytes' cursor using Snappy compression
-     ParquetWriter::new(&mut bytes).with_compression(ParquetCompression::Snappy).finish(& mut df)?;
- 
-     // Create the ByteStream body needed to upload data to S3
-     let body = aws_sdk_s3::types::ByteStream::from(bytes.into_inner());
- 
-     //Put the Object into S3
-     client
-         .put_object()
-         .bucket(destiny_bucket)
-         .key("KEY/FILENAME.snappy.parquet")
-         .body(body)
-         .send()
-         .await;    
-     
- 
-     //Print DataFrame (For Debug)
-     //println!("{:?}",df);
- 
-     Ok(())
+    // Load env args
+    let cli: Cli = Cli::parse();
+    
+    //Load aws credentials and connect a Client to S3
+    let config: aws_config::SdkConfig = aws_config::from_env().load().await;
+    let client: Client = Client::new(&config);
+
+    // Create LazyFrame
+    let df: LazyFrame = create_lazy_frame(&client, &cli.source_bucket)?;
+
+    //Get SQL context 
+    let mut ctx = SQLContext::try_new()?;
+
+    ctx.register("df", df);
+
+    let mut sql_df = ctx.execute(&cli.query).unwrap().collect().unwrap();
+
+    println!("{:?}",sql_df);
+
+    if cli.save{
+        let mut file: std::fs::File = std::fs::File::create("df.snappy.parquet").unwrap();
+        ParquetWriter::new(&mut file).with_compression(ParquetCompression::Snappy).finish(& mut sql_df)?;
+    }
+
+    Ok(())
+ }
+
+
+ #[tokio::main]
+ async fn create_lazy_frame(client:&Client, source_bucket:&str) -> Result<LazyFrame,Box<dyn std::error::Error>> {
+    //Create an empty Vector to store LazyFrames 
+    let mut dfs: Vec<LazyFrame>= Vec::new();
+
+    // Read parquet files to an Cursor use it to create an LazyFrame from Parquet
+    {   
+        //List all objects in bucket whit the chosen PREFIX
+        let objects: aws_sdk_s3::output::ListObjectsV2Output = client.list_objects_v2().bucket(source_bucket).send().await?;
+        //Loop throug all files and read each file to an Lazy Frame
+        for obj in objects.contents().unwrap_or_default() {
+            let req: aws_sdk_s3::types::AggregatedBytes = client.get_object()
+                                    .bucket(source_bucket)
+                                    .key(obj.key().unwrap())
+                                    .send()
+                                    .await?
+                                    .body
+                                    .collect()
+                                    .await?;
+
+            let df: LazyFrame = ParquetReader::new(std::io::Cursor::new(req.into_bytes()))
+                                    .finish()?
+                                    .lazy();
+            
+            //Store the LazyFrame into dfs Vec           
+            dfs.push(df);
+        };
+    };
+    
+    let df: LazyFrame = concat(dfs,true,true)?;
+
+    Ok(df)
+
  }
