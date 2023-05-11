@@ -10,6 +10,10 @@ struct Cli{
     #[arg(short = 'b', long = "sb")]
     source_bucket: String,
     
+    /// S3 bucket name/folder to save processed files
+    #[arg(short,long)]
+    destiny_bucket: Option<String>,
+
     /// Query SQL, use df as DataFrame name like: "SELECT col_a FROM df"
     #[arg(short = 'q', long = "qu", default_value_t = String::from("SELECT * FROM df"))]
     query: String,
@@ -33,20 +37,26 @@ struct Cli{
     let df: LazyFrame = create_lazy_frame(&client, &cli.source_bucket).await?;
 
     //Get SQL context 
-    let mut ctx = SQLContext::try_new()?;
+    let mut ctx: SQLContext = SQLContext::try_new()?;
 
     ctx.register("df", df);
 
-    let mut sql_df = ctx.execute(&cli.query).unwrap().collect().unwrap();
+    let mut sql_df: DataFrame = ctx.execute(&cli.query).unwrap().collect().unwrap();
 
     println!("{:?}",sql_df);
 
     if cli.save{
         let mut file: std::fs::File = std::fs::File::create("df.snappy.parquet").unwrap();
         ParquetWriter::new(&mut file).with_compression(ParquetCompression::Snappy).finish(& mut sql_df)?;
-    }
+    };
+
+    match cli.destiny_bucket{
+        Some(bucket_name) => copy_to_bucket(&client, &bucket_name,& mut sql_df).await?,
+        None => (),
+    };
 
     Ok(())
+
  }
 
 
@@ -82,4 +92,27 @@ struct Cli{
 
     Ok(df)
 
+ }
+
+ async fn copy_to_bucket(client:&Client, destiny_bucket:&str, df:& mut DataFrame) -> Result<(),Box<dyn std::error::Error>> {
+    
+    //Create an empty cursor to store DF bytes and save them into S3
+    let mut bytes: std::io::Cursor<Vec<u8>> = std::io::Cursor::new(Vec::new());
+
+    //Write the parquet data into the bytes' cursor using Snappy compression
+    ParquetWriter::new(&mut bytes).with_compression(ParquetCompression::Snappy).finish(df)?;
+
+    // Create the ByteStream body needed to upload data to S3
+    let body = aws_sdk_s3::types::ByteStream::from(bytes.into_inner());
+
+    //Put the Object into S3
+    client
+        .put_object()
+        .bucket(destiny_bucket)
+        .key("/processed.snappy.parquet")
+        .body(body)
+        .send()
+        .await;    
+
+    Ok(())
  }
