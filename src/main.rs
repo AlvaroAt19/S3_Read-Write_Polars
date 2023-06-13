@@ -2,6 +2,8 @@ use aws_sdk_s3::Client;
 use polars_sql::*;
 use polars::prelude::*;
 use clap::Parser;
+use tokio::task;
+use std::sync::{Arc,Mutex};
 
  
 #[derive(Parser)]
@@ -27,14 +29,14 @@ struct Cli{
  #[tokio::main]
  async fn main() -> Result<(),Box<dyn std::error::Error>> {
     // Load env args
-    let cli: Cli = Cli::parse();
+    let cli: Cli= Cli::parse();
     
     //Load aws credentials and connect a Client to S3
     let config: aws_config::SdkConfig = aws_config::from_env().load().await;
-    let client: Client = Client::new(&config);
+    let client: Arc<Client> = Arc::new(Client::new(&config));
 
     // Create LazyFrame
-    let df: LazyFrame = create_lazy_frame(&client, &cli.source_bucket).await?;
+    let df: LazyFrame = create_lazy_frame(Arc::clone(&client), &cli.source_bucket).await?;
 
     //Get SQL context 
     let mut ctx: SQLContext = SQLContext::try_new()?;
@@ -60,35 +62,51 @@ struct Cli{
  }
 
 
- async fn create_lazy_frame(client:&Client, source_bucket:&str) -> Result<LazyFrame,Box<dyn std::error::Error>> {
+ async fn create_lazy_frame(client:Arc<Client>, source_bucket:&str) -> Result<LazyFrame,Box<dyn std::error::Error>> {
     //Create an empty Vector to store LazyFrames 
-    let mut dfs: Vec<LazyFrame>= Vec::new();
+    let dfs: Arc<Mutex<Vec<LazyFrame>>>= Arc::new(Mutex::new(Vec::new()));
 
     // Read parquet files to an Cursor use it to create an LazyFrame from Parquet
-    {   
-        //List all objects in bucket whit the chosen PREFIX
-        let objects: aws_sdk_s3::output::ListObjectsV2Output = client.list_objects_v2().bucket(source_bucket).send().await?;
-        //Loop throug all files and read each file to an Lazy Frame
-        for obj in objects.contents().unwrap_or_default() {
-            let req: aws_sdk_s3::types::AggregatedBytes = client.get_object()
-                                    .bucket(source_bucket)
-                                    .key(obj.key().unwrap())
-                                    .send()
-                                    .await?
-                                    .body
-                                    .collect()
-                                    .await?;
+    //List all objects in bucket whit the chosen PREFIX
+    let objects: aws_sdk_s3::output::ListObjectsV2Output = client.list_objects_v2().bucket(source_bucket).send().await?;
 
-            let df: LazyFrame = ParquetReader::new(std::io::Cursor::new(req.into_bytes()))
-                                    .finish()?
-                                    .lazy();
-            
-            //Store the LazyFrame into dfs Vec           
-            dfs.push(df);
-        };
+    //Loop throug all files and read each file to an Lazy Frame
+    let mut tasks = vec![];
+
+    for obj in objects.contents().unwrap_or_default() {
+        let obj_key = obj.key().unwrap().to_owned();
+        let dfs_clone = Arc::clone(&dfs);
+        let source_bucket_clone = source_bucket.to_owned();
+        let client_clone = Arc::clone(&client);
+
+        let task = task::spawn(async move {
+        let req: aws_sdk_s3::types::AggregatedBytes = client_clone.get_object()
+                                .bucket(source_bucket_clone)
+                                .key(obj_key)
+                                .send()
+                                .await.unwrap()
+                                .body
+                                .collect()
+                                .await.unwrap();
+
+        let df: LazyFrame = ParquetReader::new(std::io::Cursor::new(req.into_bytes()))
+                                .finish().unwrap()
+                                .lazy();
+        
+        //Store the LazyFrame into dfs Vec           
+        dfs_clone.lock().unwrap().push(df);
+        }
+        );
+        tasks.push(task)
     };
+
+    for task in tasks{
+        task.await?
+    }
     
-    let df: LazyFrame = concat(dfs,true,true)?;
+    let dfs_locked:Vec<LazyFrame> = dfs.lock().unwrap().clone();
+
+    let df: LazyFrame = concat(dfs_locked,true,true)?;
 
     Ok(df)
 
@@ -109,7 +127,7 @@ struct Cli{
     client
         .put_object()
         .bucket(destiny_bucket)
-        .key("/processed.snappy.parquet")
+        .key("/processed/processed_file.snappy.parquet")
         .body(body)
         .send()
         .await;    
